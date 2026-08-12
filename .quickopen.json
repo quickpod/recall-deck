@@ -1,0 +1,13 @@
+{
+  "slug": "recall-deck",
+  "name": "RecallDeck",
+  "tagline": "Spaced-repetition flashcards (SM-2) with decks, media, stats and import/export.",
+  "categorySlug": "flashcards-memory",
+  "license": "Apache-2.0",
+  "description": "Learn efficiently with an Anki-style spaced-repetition system (SM-2 scheduling). Create decks and cards (with images), review what's due, track retention and streak statistics, and import/export decks as CSV/JSON. Fully offline; your study data stays local.",
+  "aiStack": "Python (tkinter + CLI, SQLite)",
+  "platforms": [
+    "windows"
+  ],
+  "buildEntry": "recall_deck_app.py"
+}
