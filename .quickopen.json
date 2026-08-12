@@ -7,7 +7,8 @@
   "description": "Learn efficiently with an Anki-style spaced-repetition system (SM-2 scheduling). Create decks and cards (with images), review what's due, track retention and streak statistics, and import/export decks as CSV/JSON. Fully offline; your study data stays local.",
   "aiStack": "Python (tkinter + CLI, SQLite)",
   "platforms": [
-    "windows"
+    "windows",
+    "linux"
   ],
   "buildEntry": "recall_deck_app.py"
 }
