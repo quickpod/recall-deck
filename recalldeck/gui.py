@@ -1,19 +1,25 @@
 #!/usr/bin/env python3
-r"""RecallDeck -- a pure-stdlib tkinter GUI on top of the ``recalldeck`` engine.
+r"""RecallDeck -- an Aura (QuickOpen design system) GUI on the ``recalldeck`` engine.
 
-A single main window: a left sidebar (Decks, Study, Browse/Edit, Stats,
+A single Aura window: a left sidebar (Decks, Study, Browse/Edit, Stats,
 Import/Export) and a main panel that swaps to the selected section.  Every
 operation calls the tested core library (never re-implements SRS or storage);
-failures are shown in a clear inline bar as the ``RecallDeckError`` message --
+failures are shown in the Aura status bar as the ``RecallDeckError`` message --
 never a raw traceback.
 
-Design goals baked in here (mirroring the QuickOpen house style):
-  * pure standard-library tkinter/ttk -- NO third-party GUI deps.  Dark mode is
-    a ttk-style + palette swap.
+Design goals baked in here (mirrors the QuickOpen house style):
+  * built on the vendored ``recalldeck/aura.py`` design system, which layers the
+    quickopen.ai look (deep space + light) over CustomTkinter.  Runtime deps:
+    ``customtkinter`` (+ ``darkdetect``) -- declared in requirements.txt; the
+    PyInstaller build adds ``--collect-all customtkinter``.
   * Importing this module does nothing.  Only :func:`main` builds a root window,
-    and it degrades gracefully (prints a message, returns 0) with no display.
+    and it degrades gracefully (prints a message, returns 0) with no display or
+    with customtkinter missing.
   * Frozen-exe safe: bundled assets are resolved via ``sys._MEIPASS`` / the exe
     directory when ``sys.frozen`` is set -- never ``__file__``.
+  * The SM-2 study/review flow and scheduling are unchanged -- reveal the
+    answer, grade Again/Hard/Good/Easy, and every schedule change goes through
+    ``store.apply_review`` (SM-2 in ``recalldeck.srs``).
 
 100% AI-built, open source, published on QuickOpen (quickopen.ai).
 """
@@ -24,43 +30,27 @@ import os
 import sys
 from datetime import date
 
-# NOTE: tkinter is imported lazily inside main()/build_app so that merely
-# importing this module (e.g. during packaging or on a headless CI box) never
-# fails and has no side effects.
+# NOTE: tkinter/customtkinter are imported lazily inside main()/build_app so
+# that merely importing this module (e.g. during packaging or on a headless CI
+# box) never fails and has no side effects.
 
 APP_NAME = "RecallDeck"
 APP_VERSION = "1.0.0"
 WINDOW_TITLE = "RecallDeck — by QuickOpen (quickopen.ai)"
 PROJECT_URL = "https://quickopen.ai"
+ACCENT = "#5b86f7"      # publish/specs/recall-deck.json "accent": [91, 134, 247]
 
 # Study grade buttons -> SM-2 qualities.
 GRADES = [("Again", 2), ("Hard", 3), ("Good", 4), ("Easy", 5)]
 
+# (id, label, DejaVu-safe nav glyph)
 SECTIONS = [
-    ("decks", "Decks"),
-    ("study", "Study"),
-    ("browse", "Browse / Edit"),
-    ("stats", "Stats"),
-    ("io", "Import / Export"),
+    ("decks", "Decks", "⛁"),
+    ("study", "Study", "↻"),
+    ("browse", "Browse / Edit", "✎"),
+    ("stats", "Stats", "▦"),
+    ("io", "Import / Export", "⇅"),
 ]
-
-# ---- colour palettes (mirror the QuickOpen palette) -------------------------
-PALETTES = {
-    "light": {
-        "bg": "#f5f7fa", "surface": "#ffffff", "text": "#141820",
-        "muted": "#5b6472", "primary": "#2f5fe0", "primary_hi": "#2450c8",
-        "entry": "#ffffff", "border": "#d5dae2", "sel": "#2f5fe0",
-        "sel_fg": "#ffffff", "trough": "#e2e7ef", "ok": "#1f7a3d",
-        "err": "#c0392b",
-    },
-    "dark": {
-        "bg": "#0f1115", "surface": "#1a1e24", "text": "#f1f3f7",
-        "muted": "#9aa4b2", "primary": "#5b86f7", "primary_hi": "#7098ff",
-        "entry": "#1a1e24", "border": "#2a2f38", "sel": "#5b86f7",
-        "sel_fg": "#0f1115", "trough": "#2a2f38", "ok": "#5bd68a",
-        "err": "#ff6b5e",
-    },
-}
 
 SECTION_DESCRIPTIONS = {
     "decks": "Create, rename and delete decks. Select a deck to study or browse.",
@@ -99,52 +89,57 @@ def asset_path(name):
 
 
 # ---------------------------------------------------------------------------
-# GUI construction (kept inside a function so import never needs a display)
+# GUI construction (kept inside a function so import never needs a display and
+# never needs customtkinter installed)
 # ---------------------------------------------------------------------------
 def build_app():
-    """Construct and return the App class bound to a live tkinter import."""
+    """Construct and return the App class bound to live GUI imports."""
     import tkinter as tk
     from tkinter import ttk, filedialog, messagebox, simpledialog
+    import customtkinter as ctk
 
-    from . import guiconfig
+    from . import aura, guiconfig
     from .errors import RecallDeckError
     from .db import Store
-    from . import importer, srs, stats as stats_mod
+    from . import importer, stats as stats_mod
 
-    FONT = "Segoe UI"
+    def _tok(key):
+        """(light, dark) tuple for a TOKENS key -- CustomTkinter auto-switches."""
+        return (aura.TOKENS["light"][key], aura.TOKENS["dark"][key])
 
-    class App(tk.Tk):
+    class App(aura.AuraApp):
         def __init__(self):
-            super().__init__()
-            self.title(WINDOW_TITLE)
-            self.geometry("1040x660")
-            self.minsize(860, 540)
+            super().__init__(
+                title=WINDOW_TITLE, app_name=APP_NAME, accent=ACCENT,
+                theme=guiconfig.get_theme(),
+                icon_png=asset_path("recall-deck.png"), version=APP_VERSION,
+                tagline="spaced repetition",
+                on_theme_change=guiconfig.set_theme,
+                size=(1040, 660), min_size=(860, 540))
 
-            self.theme = guiconfig.get_theme()
-            self._tracked = []          # (tk_widget, role) for manual re-theming
-            self._img_refs = []         # keep PhotoImage refs alive
-            self._panels = {}           # section_id -> built frame (lazy)
-            self._current = None
+            self._img_refs_gui = []      # keep PhotoImage refs alive
 
             # data / study state
             self.store = Store()
-            self.current_deck = None    # Deck or None
-            self._study_queue = []      # remaining due Cards
+            self.current_deck = None     # Deck or None
+            self._study_queue = []       # remaining due Cards
             self._study_card = None
             self._answer_shown = False
 
             self._set_icon()
             self._build_menu()
-            self._build_layout()
-            self._apply_theme()
+            for sid, label, glyph in SECTIONS:
+                self.add_section(sid, label, glyph,
+                                 getattr(self, "_build_" + sid))
+            self.show("decks")
+            self.set_status("Ready")
             self.protocol("WM_DELETE_WINDOW", self._on_close)
-            self.after(50, self._select_first_section)
 
         # ---- assets / icon
         def _set_icon(self):
             try:
                 ico = asset_path("recall-deck.ico")
-                if ico:
+                if ico and os.name == "nt":
                     self.iconbitmap(ico)
                     return
             except Exception:
@@ -153,121 +148,35 @@ def build_app():
                 png = asset_path("recall-deck.png")
                 if png:
                     img = tk.PhotoImage(file=png)
-                    self._img_refs.append(img)
+                    self._img_refs_gui.append(img)
                     self.iconphoto(True, img)
             except Exception:
                 pass  # icon is cosmetic; never block launch
 
-        # ---- theming
-        def track(self, widget, role):
-            self._tracked.append((widget, role))
+        # ---- navigation: raise the section, then refresh its dynamic content
+        def show(self, sid):
+            super().show(sid)
+            refresh = getattr(self, "_refresh_" + sid, None)
+            if refresh:
+                refresh()
 
-        def _pal(self):
-            return PALETTES[self.theme]
+        # ---- theme: redraw the manually-coloured stats canvas on a flip
+        def set_theme(self, theme):
+            super().set_theme(theme)
+            if self.active_section == "stats":
+                self._draw_stats()
 
-        def _apply_theme(self):
-            p = self._pal()
-            style = ttk.Style(self)
-            try:
-                style.theme_use("clam")
-            except Exception:
-                pass
-            self.configure(bg=p["bg"])
-            style.configure(".", background=p["bg"], foreground=p["text"],
-                            fieldbackground=p["entry"], bordercolor=p["border"],
-                            font=(FONT, 10))
-            style.configure("TFrame", background=p["bg"])
-            style.configure("Sidebar.TFrame", background=p["surface"])
-            style.configure("Card.TFrame", background=p["surface"])
-            style.configure("TLabel", background=p["bg"], foreground=p["text"])
-            style.configure("Muted.TLabel", background=p["bg"], foreground=p["muted"])
-            style.configure("Header.TLabel", background=p["bg"], foreground=p["text"],
-                            font=(FONT, 15, "bold"))
-            style.configure("Sub.TLabel", background=p["bg"], foreground=p["muted"],
-                            font=(FONT, 10))
-            style.configure("Brand.TLabel", background=p["surface"],
-                            foreground=p["text"], font=(FONT, 12, "bold"))
-            style.configure("Status.TLabel", background=p["surface"],
-                            foreground=p["muted"])
-            style.configure("Face.TLabel", background=p["surface"],
-                            foreground=p["text"], font=(FONT, 18))
-            style.configure("Big.TLabel", background=p["bg"], foreground=p["text"],
-                            font=(FONT, 22, "bold"))
-            style.configure("TButton", background=p["surface"], foreground=p["text"],
-                            bordercolor=p["border"], focuscolor=p["surface"],
-                            padding=(10, 5))
-            style.map("TButton",
-                      background=[("active", p["trough"]), ("disabled", p["bg"])],
-                      foreground=[("disabled", p["muted"])])
-            style.configure("Accent.TButton", background=p["primary"],
-                            foreground="#ffffff", padding=(12, 6))
-            style.map("Accent.TButton",
-                      background=[("active", p["primary_hi"]),
-                                  ("disabled", p["border"])],
-                      foreground=[("disabled", p["muted"])])
-            style.configure("Toggle.TButton", background=p["surface"],
-                            foreground=p["text"], padding=(8, 4))
-            style.configure("TEntry", fieldbackground=p["entry"], foreground=p["text"],
-                            insertcolor=p["text"], bordercolor=p["border"])
-            style.configure("TCheckbutton", background=p["bg"], foreground=p["text"])
-            style.map("TCheckbutton", background=[("active", p["bg"])])
-            style.configure("TLabelframe", background=p["bg"], foreground=p["text"],
-                            bordercolor=p["border"])
-            style.configure("TLabelframe.Label", background=p["bg"],
-                            foreground=p["muted"])
-            style.configure("Treeview", background=p["surface"],
-                            fieldbackground=p["surface"], foreground=p["text"],
-                            bordercolor=p["border"], rowheight=24)
-            style.map("Treeview", background=[("selected", p["primary"])],
-                      foreground=[("selected", p["sel_fg"])])
-            style.configure("Sidebar.Treeview", background=p["surface"],
-                            fieldbackground=p["surface"])
-            style.configure("Bar.Horizontal.TProgressbar", background=p["primary"],
-                            troughcolor=p["trough"], bordercolor=p["border"])
-            style.configure("TScrollbar", background=p["surface"],
-                            troughcolor=p["bg"], bordercolor=p["border"],
-                            arrowcolor=p["text"])
-            style.configure("TSeparator", background=p["border"])
-
-            for widget, role in list(self._tracked):
-                try:
-                    if role == "listbox":
-                        widget.configure(bg=p["surface"], fg=p["text"],
-                                         selectbackground=p["primary"],
-                                         selectforeground=p["sel_fg"],
-                                         highlightthickness=1,
-                                         highlightbackground=p["border"],
-                                         borderwidth=0)
-                    elif role == "text":
-                        widget.configure(bg=p["surface"], fg=p["text"],
-                                         insertbackground=p["text"],
-                                         highlightthickness=1,
-                                         highlightbackground=p["border"],
-                                         borderwidth=0)
-                    elif role == "canvas":
-                        widget.configure(bg=p["surface"], highlightthickness=1,
-                                         highlightbackground=p["border"])
-                except Exception:
-                    pass
-
-        def toggle_theme(self):
-            self.theme = "dark" if self.theme == "light" else "light"
-            guiconfig.set_theme(self.theme)
-            self._apply_theme()
-            self._theme_btn.configure(
-                text="☀ Light mode" if self.theme == "dark" else "🌙 Dark mode")
-            # redraw the stats bars (canvas colours are manual)
-            if self._current_id == "stats":
-                self._refresh_stats()
-
-        # ---- menu
+        # ---- menu (native menus stay; theme lives in the sidebar toggle too)
         def _build_menu(self):
             bar = tk.Menu(self)
             filem = tk.Menu(bar, tearoff=0)
             filem.add_command(label="Exit", command=self._on_close)
             bar.add_cascade(label="File", menu=filem)
             viewm = tk.Menu(bar, tearoff=0)
-            viewm.add_command(label="Toggle dark mode", command=self.toggle_theme)
+            viewm.add_command(
+                label="Toggle dark mode",
+                command=lambda: self.set_theme(
+                    "light" if self.theme == "dark" else "dark"))
             bar.add_cascade(label="View", menu=viewm)
             helpm = tk.Menu(bar, tearoff=0)
             helpm.add_command(
@@ -280,125 +189,19 @@ def build_app():
             bar.add_cascade(label="Help", menu=helpm)
             self.config(menu=bar)
 
-        # ---- layout
-        def _build_layout(self):
-            top = ttk.Frame(self, style="Sidebar.TFrame", padding=(12, 8))
-            top.pack(fill="x", side="top")
-            ttk.Label(top, text=APP_NAME, style="Brand.TLabel").pack(side="left")
-            ttk.Label(top, style="Status.TLabel",
-                      text="  offline · open source · by QuickOpen").pack(side="left")
-            self._theme_btn = ttk.Button(
-                top, style="Toggle.TButton", command=self.toggle_theme,
-                text="☀ Light mode" if self.theme == "dark" else "🌙 Dark mode")
-            self._theme_btn.pack(side="right")
-
-            body = ttk.Frame(self, style="TFrame")
-            body.pack(fill="both", expand=True)
-
-            side = ttk.Frame(body, style="Sidebar.TFrame", width=200)
-            side.pack(side="left", fill="y")
-            side.pack_propagate(False)
-            self.nav = ttk.Treeview(side, show="tree", selectmode="browse",
-                                    style="Sidebar.Treeview")
-            self.nav.pack(fill="both", expand=True, padx=6, pady=6)
-            self._nav_ids = {}
-            for sid, label in SECTIONS:
-                iid = self.nav.insert("", "end", text="  " + label)
-                self._nav_ids[iid] = sid
-            self.nav.bind("<<TreeviewSelect>>", self._on_nav_select)
-
-            main = ttk.Frame(body, style="TFrame", padding=(16, 12))
-            main.pack(side="left", fill="both", expand=True)
-
-            head = ttk.Frame(main, style="TFrame")
-            head.pack(fill="x")
-            self.title_lbl = ttk.Label(head, text="Welcome", style="Header.TLabel")
-            self.title_lbl.pack(anchor="w")
-            self.desc_lbl = ttk.Label(head, text="", style="Sub.TLabel",
-                                      wraplength=720, justify="left")
-            self.desc_lbl.pack(anchor="w", pady=(2, 8))
-            ttk.Separator(main).pack(fill="x")
-
-            self.container = ttk.Frame(main, style="TFrame")
-            self.container.pack(fill="both", expand=True, pady=(10, 8))
-            self._current_id = None
-
-            # shared inline result / error bar
-            bar = ttk.Frame(self, style="Sidebar.TFrame", padding=(12, 6))
-            bar.pack(fill="x", side="bottom")
-            self.status_lbl = ttk.Label(bar, text="Ready", style="Status.TLabel",
-                                        width=14, anchor="w")
-            self.status_lbl.pack(side="left")
-            self.result_lbl = ttk.Label(bar, text="", style="Status.TLabel",
-                                        anchor="w", wraplength=760, justify="left")
-            self.result_lbl.pack(side="left", fill="x", expand=True, padx=8)
-
-        # ---- section navigation
-        def _select_first_section(self):
-            for iid in self._nav_ids:
-                self.nav.selection_set(iid)
-                self.nav.see(iid)
-                break
-
-        def _on_nav_select(self, _e=None):
-            sel = self.nav.selection()
-            if not sel:
-                return
-            sid = self._nav_ids.get(sel[0])
-            if sid:
-                self._show_section(sid)
-
-        def _show_section(self, sid):
-            if self._current is not None:
-                self._current.pack_forget()
-            panel = self._panels.get(sid)
-            if panel is None:
-                panel = ttk.Frame(self.container, style="TFrame")
-                getattr(self, "_build_" + sid)(panel)
-                self._panels[sid] = panel
-                self._apply_theme()
-            panel.pack(fill="both", expand=True)
-            self._current = panel
-            self._current_id = sid
-            label = dict(SECTIONS).get(sid, sid)
-            self.title_lbl.configure(text=label)
-            self.desc_lbl.configure(text=SECTION_DESCRIPTIONS.get(sid, ""))
-            self._clear_result()
-            # refresh dynamic content on entry
-            refresh = getattr(self, "_refresh_" + sid, None)
-            if refresh:
-                refresh()
-
-        # ---- inline result bar
-        def _set_status(self, text, kind="idle"):
-            p = self._pal()
-            color = {"ok": p["ok"], "err": p["err"]}.get(kind, p["muted"])
-            self.status_lbl.configure(text=text, foreground=color)
-
-        def _clear_result(self):
-            self.result_lbl.configure(text="")
-            self._set_status("Ready")
-
-        def _show_error(self, message):
-            self.result_lbl.configure(text="✕ " + message, foreground=self._pal()["err"])
-            self._set_status("error", kind="err")
-
-        def _show_ok(self, message):
-            self.result_lbl.configure(text="✓ " + message, foreground=self._pal()["ok"])
-            self._set_status("done", kind="ok")
-
+        # ---- inline status bar (the Aura status bar is the app's voice)
         def _guard(self, fn, ok_msg=None):
             """Run *fn*; surface RecallDeckError inline, never a traceback."""
             try:
                 result = fn()
             except RecallDeckError as exc:
-                self._show_error(str(exc))
+                self.set_error(str(exc))
                 return None
             except Exception as exc:  # never leak a traceback to the user
-                self._show_error(f"Unexpected error: {exc}")
+                self.set_error(f"Unexpected error: {exc}")
                 return None
             if ok_msg:
-                self._show_ok(ok_msg)
+                self.set_success(ok_msg)
             return result
 
         def _deck_names(self):
@@ -410,27 +213,35 @@ def build_app():
         # =================================================================
         # Section: Decks
         # =================================================================
-        def _build_decks(self, panel):
-            left = ttk.Frame(panel, style="TFrame")
-            left.pack(side="left", fill="both", expand=True)
-            self.deck_list = tk.Listbox(left, exportselection=False, activestyle="none")
-            self.track(self.deck_list, "listbox")
+        def _build_decks(self, frame):
+            aura.Caption(frame, SECTION_DESCRIPTIONS["decks"]).pack(
+                anchor="w", pady=(0, 14))
+            body = ctk.CTkFrame(frame, fg_color="transparent")
+            body.pack(fill="both", expand=True)
+
+            left = aura.Card(body, title="Your decks")
+            left.pack(side="left", fill="both", expand=True, padx=(0, 14))
+            self.deck_list = tk.Listbox(left.body, exportselection=False,
+                                        activestyle="none", height=12,
+                                        borderwidth=0, highlightthickness=1)
+            aura.track(self.deck_list, "listbox")
             self.deck_list.pack(fill="both", expand=True)
             self.deck_list.bind("<<ListboxSelect>>", self._on_deck_pick)
 
-            right = ttk.Frame(panel, style="TFrame", padding=(12, 0))
+            right = ctk.CTkFrame(body, fg_color="transparent", width=180)
             right.pack(side="left", fill="y")
-            ttk.Button(right, text="New deck…", style="Accent.TButton",
-                       command=self._deck_new).pack(fill="x", pady=3)
-            ttk.Button(right, text="Rename…", command=self._deck_rename).pack(
+            aura.AuraButton(right, "New deck…",
+                            command=self._deck_new).pack(fill="x", pady=3)
+            aura.AuraButton(right, "Rename…", kind="secondary",
+                            command=self._deck_rename).pack(fill="x", pady=3)
+            aura.AuraButton(right, "Delete", kind="danger",
+                            command=self._deck_delete).pack(fill="x", pady=3)
+            aura.AuraButton(right, "Study this deck", kind="secondary",
+                            command=lambda: self._go_deck("study")).pack(
+                fill="x", pady=(16, 3))
+            aura.AuraButton(right, "Browse cards", kind="secondary",
+                            command=lambda: self._go_deck("browse")).pack(
                 fill="x", pady=3)
-            ttk.Button(right, text="Delete", command=self._deck_delete).pack(
-                fill="x", pady=3)
-            ttk.Separator(right).pack(fill="x", pady=8)
-            ttk.Button(right, text="Study this deck",
-                       command=lambda: self._go_deck("study")).pack(fill="x", pady=3)
-            ttk.Button(right, text="Browse cards",
-                       command=lambda: self._go_deck("browse")).pack(fill="x", pady=3)
 
         def _refresh_decks(self):
             if not hasattr(self, "deck_list"):
@@ -462,7 +273,7 @@ def build_app():
         def _deck_rename(self):
             name = self._selected_deck_name()
             if not name:
-                self._show_error("Select a deck to rename.")
+                self.set_error("Select a deck to rename.")
                 return
             new = simpledialog.askstring("Rename deck", "New name:",
                                          initialvalue=name, parent=self)
@@ -475,7 +286,7 @@ def build_app():
         def _deck_delete(self):
             name = self._selected_deck_name()
             if not name:
-                self._show_error("Select a deck to delete.")
+                self.set_error("Select a deck to delete.")
                 return
             if not messagebox.askyesno("Delete deck",
                                        f"Delete {name!r} and all its cards?"):
@@ -488,53 +299,57 @@ def build_app():
         def _go_deck(self, section):
             name = self._selected_deck_name()
             if not name:
-                self._show_error("Select a deck first.")
+                self.set_error("Select a deck first.")
                 return
             self.current_deck = self._guard(lambda: self.store.get_deck(name))
-            for iid, sid in self._nav_ids.items():
-                if sid == section:
-                    self.nav.selection_set(iid)
-                    return
+            self.show(section)
 
         # =================================================================
         # Section: Study
         # =================================================================
-        def _build_study(self, panel):
-            bar = ttk.Frame(panel, style="TFrame")
+        def _build_study(self, frame):
+            aura.Caption(frame, SECTION_DESCRIPTIONS["study"]).pack(
+                anchor="w", pady=(0, 14))
+            bar = ctk.CTkFrame(frame, fg_color="transparent")
             bar.pack(fill="x")
-            ttk.Label(bar, text="Deck:", style="Muted.TLabel").pack(side="left")
+            ctk.CTkLabel(bar, text="Deck", font=aura.font(),
+                         text_color=_tok("muted")).pack(side="left")
             self.study_deck = tk.StringVar()
-            self.study_menu = ttk.Combobox(bar, textvariable=self.study_deck,
-                                           state="readonly", width=28)
-            self.study_menu.pack(side="left", padx=6)
-            ttk.Button(bar, text="Start", style="Accent.TButton",
-                       command=self._study_start).pack(side="left", padx=4)
-            self.study_progress = ttk.Label(bar, text="", style="Muted.TLabel")
+            self.study_menu = aura.AuraCombo(bar, variable=self.study_deck,
+                                             values=[], state="readonly",
+                                             width=240)
+            self.study_menu.pack(side="left", padx=(8, 8))
+            aura.AuraButton(bar, "Start",
+                            command=self._study_start).pack(side="left")
+            self.study_progress = aura.Caption(bar, "")
             self.study_progress.pack(side="right")
 
-            face = ttk.Frame(panel, style="Card.TFrame", padding=20)
+            face = aura.Card(frame)
             face.pack(fill="both", expand=True, pady=12)
-            self.card_front = ttk.Label(face, text="Press Start to begin.",
-                                        style="Face.TLabel", wraplength=640,
-                                        justify="center", anchor="center")
+            self.card_front = ctk.CTkLabel(
+                face.body, text="Press Start to begin.", font=aura.font(18),
+                wraplength=640, justify="center")
             self.card_front.pack(fill="x", expand=True, pady=(20, 8))
-            ttk.Separator(face).pack(fill="x", pady=6)
-            self.card_back = ttk.Label(face, text="", style="Face.TLabel",
-                                       wraplength=640, justify="center",
-                                       anchor="center", foreground=self._pal()["muted"])
+            ctk.CTkFrame(face.body, height=1, fg_color=_tok("border")).pack(
+                fill="x", pady=6)
+            self.card_back = ctk.CTkLabel(
+                face.body, text="", font=aura.font(18),
+                text_color=_tok("muted"), wraplength=640, justify="center")
             self.card_back.pack(fill="x", expand=True, pady=(8, 20))
 
-            ctrl = ttk.Frame(panel, style="TFrame")
+            ctrl = ctk.CTkFrame(frame, fg_color="transparent")
             ctrl.pack(fill="x")
-            self.show_btn = ttk.Button(ctrl, text="Show Answer",
-                                       style="Accent.TButton",
-                                       command=self._study_reveal)
+            self.show_btn = aura.AuraButton(ctrl, "Show Answer",
+                                            command=self._study_reveal)
             self.show_btn.pack()
-            self.grade_frame = ttk.Frame(panel, style="TFrame")
+            self.grade_frame = ctk.CTkFrame(frame, fg_color="transparent")
             self.grade_frame.pack(fill="x", pady=6)
+            grade_kind = {2: "danger", 3: "secondary", 4: "primary",
+                          5: "secondary"}
             for label, q in GRADES:
-                ttk.Button(self.grade_frame, text=label,
-                           command=lambda qq=q: self._study_grade(qq)).pack(
+                aura.AuraButton(
+                    self.grade_frame, label, kind=grade_kind.get(q, "secondary"),
+                    command=lambda qq=q: self._study_grade(qq)).pack(
                     side="left", expand=True, fill="x", padx=3)
 
         def _refresh_study(self):
@@ -565,7 +380,7 @@ def build_app():
         def _study_start(self):
             name = self.study_deck.get()
             if not name:
-                self._show_error("Pick a deck to study.")
+                self.set_error("Pick a deck to study.")
                 return
             queue = self._guard(lambda: self.store.due_cards(name, self._today()))
             if queue is None:
@@ -591,7 +406,7 @@ def build_app():
                 self.show_btn.state(["disabled"])
                 self.study_progress.configure(
                     text=f"{self._reviewed_count} reviewed")
-                self._show_ok("Study session complete.")
+                self.set_success("Study session complete.")
                 return
             self._study_card = self._study_queue.pop(0)
             self._answer_shown = False
@@ -625,29 +440,39 @@ def build_app():
         # =================================================================
         # Section: Browse / Edit
         # =================================================================
-        def _build_browse(self, panel):
-            bar = ttk.Frame(panel, style="TFrame")
+        def _build_browse(self, frame):
+            aura.Caption(frame, SECTION_DESCRIPTIONS["browse"]).pack(
+                anchor="w", pady=(0, 14))
+            bar = ctk.CTkFrame(frame, fg_color="transparent")
             bar.pack(fill="x")
-            ttk.Label(bar, text="Deck:", style="Muted.TLabel").pack(side="left")
+            ctk.CTkLabel(bar, text="Deck", font=aura.font(),
+                         text_color=_tok("muted")).pack(side="left")
             self.browse_deck = tk.StringVar()
-            self.browse_menu = ttk.Combobox(bar, textvariable=self.browse_deck,
-                                            state="readonly", width=28)
-            self.browse_menu.pack(side="left", padx=6)
-            self.browse_menu.bind("<<ComboboxSelected>>",
-                                  lambda _e: self._browse_load())
-            ttk.Button(bar, text="Add card…", style="Accent.TButton",
-                       command=self._card_add).pack(side="left", padx=4)
-            ttk.Button(bar, text="Edit…", command=self._card_edit).pack(side="left")
-            ttk.Button(bar, text="Delete", command=self._card_delete).pack(
-                side="left", padx=4)
+            self.browse_menu = aura.AuraCombo(
+                bar, variable=self.browse_deck, values=[], state="readonly",
+                width=240, command=lambda _v: self._browse_load())
+            self.browse_menu.pack(side="left", padx=(8, 8))
+            aura.AuraButton(bar, "Add card…",
+                            command=self._card_add).pack(side="left")
+            aura.AuraButton(bar, "Edit…", kind="secondary",
+                            command=self._card_edit).pack(side="left", padx=8)
+            aura.AuraButton(bar, "Delete", kind="danger",
+                            command=self._card_delete).pack(side="left")
 
+            body = ctk.CTkFrame(frame, fg_color="transparent")
+            body.pack(fill="both", expand=True, pady=(10, 0))
             cols = ("front", "back", "tags", "due")
-            self.card_tree = ttk.Treeview(panel, columns=cols, show="headings",
+            self.card_tree = ttk.Treeview(body, columns=cols, show="headings",
                                           selectmode="browse")
-            for c, w in zip(cols, (240, 240, 120, 100)):
-                self.card_tree.heading(c, text=c.capitalize())
+            for c, label, w in (("front", "Front", 240), ("back", "Back", 240),
+                                ("tags", "Tags", 120), ("due", "Due", 100)):
+                self.card_tree.heading(c, text=aura.spaced(label), anchor="w")
                 self.card_tree.column(c, width=w, anchor="w")
-            self.card_tree.pack(fill="both", expand=True, pady=(8, 0))
+            sb = ttk.Scrollbar(body, orient="vertical",
+                               command=self.card_tree.yview)
+            self.card_tree.configure(yscrollcommand=sb.set)
+            sb.pack(side="right", fill="y")
+            self.card_tree.pack(side="left", fill="both", expand=True)
             self._card_row_ids = {}
 
         def _refresh_browse(self):
@@ -680,31 +505,35 @@ def build_app():
         def _card_dialog(self, title, front="", back="", tags=""):
             win = tk.Toplevel(self)
             win.title(title)
-            win.configure(bg=self._pal()["bg"])
+            win.configure(bg=aura.P("bg"))
             win.transient(self)
             result = {}
-            frm = ttk.Frame(win, style="TFrame", padding=12)
-            frm.pack(fill="both", expand=True)
-            fv, bv, tv = tk.StringVar(value=front), tk.StringVar(value=back), \
-                tk.StringVar(value=tags)
-            for i, (lbl, var) in enumerate((("Front", fv), ("Back", bv),
-                                            ("Tags", tv))):
-                ttk.Label(frm, text=lbl, style="Muted.TLabel").grid(
-                    row=i, column=0, sticky="w", pady=4)
-                ttk.Entry(frm, textvariable=var, width=40).grid(
-                    row=i, column=1, pady=4, padx=6)
-            btns = ttk.Frame(frm, style="TFrame")
-            btns.grid(row=3, column=0, columnspan=2, pady=(8, 0))
+            frm = ctk.CTkFrame(win, fg_color="transparent")
+            frm.pack(fill="both", expand=True, padx=16, pady=16)
+            entries = {}
+            for i, (lbl, val) in enumerate((("Front", front), ("Back", back),
+                                            ("Tags", tags))):
+                ctk.CTkLabel(frm, text=lbl, font=aura.font(),
+                             text_color=_tok("muted")).grid(
+                    row=i, column=0, sticky="w", pady=6, padx=(0, 10))
+                ent = aura.AuraEntry(frm, width=320)
+                if val:
+                    ent.insert(0, val)
+                ent.grid(row=i, column=1, pady=6)
+                entries[lbl.lower()] = ent
+            btns = ctk.CTkFrame(frm, fg_color="transparent")
+            btns.grid(row=3, column=0, columnspan=2, pady=(12, 0), sticky="e")
 
             def ok():
-                result["front"] = fv.get()
-                result["back"] = bv.get()
-                result["tags"] = tv.get()
+                result["front"] = entries["front"].get()
+                result["back"] = entries["back"].get()
+                result["tags"] = entries["tags"].get()
                 win.destroy()
 
-            ttk.Button(btns, text="Save", style="Accent.TButton",
-                       command=ok).pack(side="left", padx=4)
-            ttk.Button(btns, text="Cancel", command=win.destroy).pack(side="left")
+            aura.AuraButton(btns, "Save", command=ok).pack(side="left",
+                                                           padx=(0, 8))
+            aura.AuraButton(btns, "Cancel", kind="secondary",
+                            command=win.destroy).pack(side="left")
             win.grab_set()
             self.wait_window(win)
             return result or None
@@ -712,7 +541,7 @@ def build_app():
         def _card_add(self):
             name = self.browse_deck.get()
             if not name:
-                self._show_error("Pick a deck first.")
+                self.set_error("Pick a deck first.")
                 return
             data = self._card_dialog("Add card")
             if not data:
@@ -725,7 +554,7 @@ def build_app():
         def _card_edit(self):
             cid = self._selected_card_id()
             if not cid:
-                self._show_error("Select a card to edit.")
+                self.set_error("Select a card to edit.")
                 return
             card = self._guard(lambda: self.store.get_card(cid))
             if not card:
@@ -741,7 +570,7 @@ def build_app():
         def _card_delete(self):
             cid = self._selected_card_id()
             if not cid:
-                self._show_error("Select a card to delete.")
+                self.set_error("Select a card to delete.")
                 return
             if not messagebox.askyesno("Delete card", "Delete this card?"):
                 return
@@ -752,19 +581,22 @@ def build_app():
         # =================================================================
         # Section: Stats
         # =================================================================
-        def _build_stats(self, panel):
-            bar = ttk.Frame(panel, style="TFrame")
+        def _build_stats(self, frame):
+            aura.Caption(frame, SECTION_DESCRIPTIONS["stats"]).pack(
+                anchor="w", pady=(0, 14))
+            bar = ctk.CTkFrame(frame, fg_color="transparent")
             bar.pack(fill="x")
-            ttk.Label(bar, text="Deck:", style="Muted.TLabel").pack(side="left")
+            ctk.CTkLabel(bar, text="Deck", font=aura.font(),
+                         text_color=_tok("muted")).pack(side="left")
             self.stats_deck = tk.StringVar()
-            self.stats_menu = ttk.Combobox(bar, textvariable=self.stats_deck,
-                                           state="readonly", width=28)
-            self.stats_menu.pack(side="left", padx=6)
-            self.stats_menu.bind("<<ComboboxSelected>>",
-                                 lambda _e: self._refresh_stats())
-            self.stats_canvas = tk.Canvas(panel, height=320, highlightthickness=1)
-            self.track(self.stats_canvas, "canvas")
-            self.stats_canvas.pack(fill="both", expand=True, pady=(10, 0))
+            self.stats_menu = aura.AuraCombo(
+                bar, variable=self.stats_deck, values=[], state="readonly",
+                width=240, command=lambda _v: self._refresh_stats())
+            self.stats_menu.pack(side="left", padx=(8, 8))
+            self.stats_canvas = tk.Canvas(frame, height=320, bd=0,
+                                          highlightthickness=1)
+            aura.track(self.stats_canvas, "canvas")
+            self.stats_canvas.pack(fill="both", expand=True, pady=(12, 0))
 
         def _refresh_stats(self):
             if not hasattr(self, "stats_menu"):
@@ -778,7 +610,9 @@ def build_app():
             self._draw_stats()
 
         def _draw_stats(self):
-            c = self.stats_canvas
+            c = getattr(self, "stats_canvas", None)
+            if c is None:
+                return
             c.delete("all")
             name = self.stats_deck.get()
             if not name:
@@ -787,7 +621,7 @@ def build_app():
                 self.store, name, self._today()))
             if not s:
                 return
-            p = self._pal()
+            accent, text, muted = aura.P("accent"), aura.P("text"), aura.P("muted")
             bars = [("Total", s["total"]), ("Due", s["due"]), ("New", s["new"]),
                     ("Young", s["young"]), ("Mature", s["mature"]),
                     ("Lapses", s["lapses"])]
@@ -796,44 +630,54 @@ def build_app():
             for label, val in bars:
                 h = int(maxh * val / top)
                 c.create_rectangle(x, base - h, x + bw, base,
-                                   fill=p["primary"], outline=p["primary"])
+                                   fill=accent, outline=accent)
                 c.create_text(x + bw / 2, base - h - 12, text=str(val),
-                              fill=p["text"], font=(FONT, 10, "bold"))
-                c.create_text(x + bw / 2, base + 14, text=label, fill=p["muted"],
-                              font=(FONT, 9))
+                              fill=text, font=aura.font(10, "bold"))
+                c.create_text(x + bw / 2, base + 14, text=label, fill=muted,
+                              font=aura.font(9))
                 x += bw + gap
             retention = "n/a" if s["retention"] is None else f"{s['retention']:.1f}%"
-            c.create_text(40, 30, anchor="w", fill=p["text"], font=(FONT, 13, "bold"),
+            c.create_text(40, 30, anchor="w", fill=text, font=aura.font(13, "bold"),
                           text=f"{name}  —  retention {retention}  ·  "
                                f"{s['reviews']} reviews")
 
         # =================================================================
         # Section: Import / Export
         # =================================================================
-        def _build_io(self, panel):
-            bar = ttk.Frame(panel, style="TFrame")
+        def _build_io(self, frame):
+            aura.Caption(frame, SECTION_DESCRIPTIONS["io"]).pack(
+                anchor="w", pady=(0, 14))
+            bar = ctk.CTkFrame(frame, fg_color="transparent")
             bar.pack(fill="x")
-            ttk.Label(bar, text="Deck:", style="Muted.TLabel").pack(side="left")
+            ctk.CTkLabel(bar, text="Deck", font=aura.font(),
+                         text_color=_tok("muted")).pack(side="left")
             self.io_deck = tk.StringVar()
-            self.io_menu = ttk.Combobox(bar, textvariable=self.io_deck,
-                                        state="readonly", width=28)
-            self.io_menu.pack(side="left", padx=6)
+            self.io_menu = aura.AuraCombo(bar, variable=self.io_deck, values=[],
+                                          state="readonly", width=240)
+            self.io_menu.pack(side="left", padx=(8, 8))
 
-            body = ttk.Frame(panel, style="TFrame", padding=(0, 16))
-            body.pack(fill="x")
-            imp = ttk.Labelframe(body, text="Import", padding=12)
-            imp.pack(fill="x", pady=6)
-            ttk.Label(imp, text="Add cards from a CSV (front,back,tags) or JSON file.",
-                      style="Muted.TLabel").pack(anchor="w")
-            ttk.Button(imp, text="Choose file & import…", style="Accent.TButton",
-                       command=self._do_import).pack(anchor="w", pady=(8, 0))
+            imp = aura.Card(frame, title="Import")
+            imp.pack(fill="x", pady=(16, 8))
+            ctk.CTkLabel(
+                imp.body, justify="left", anchor="w", font=aura.font(),
+                text_color=_tok("muted"),
+                text="Add cards from a CSV (front,back,tags) or JSON file.").pack(
+                anchor="w")
+            aura.AuraButton(imp.body, "Choose file & import…",
+                            command=self._do_import).pack(anchor="w",
+                                                          pady=(10, 0))
 
-            exp = ttk.Labelframe(body, text="Export", padding=12)
-            exp.pack(fill="x", pady=6)
-            ttk.Label(exp, text="Save this deck's cards to a CSV or JSON file.",
-                      style="Muted.TLabel").pack(anchor="w")
-            ttk.Button(exp, text="Choose destination & export…",
-                       command=self._do_export).pack(anchor="w", pady=(8, 0))
+            exp = aura.Card(frame, title="Export")
+            exp.pack(fill="x", pady=(0, 8))
+            ctk.CTkLabel(
+                exp.body, justify="left", anchor="w", font=aura.font(),
+                text_color=_tok("muted"),
+                text="Save this deck's cards to a CSV or JSON file.").pack(
+                anchor="w")
+            aura.AuraButton(exp.body, "Choose destination & export…",
+                            kind="secondary",
+                            command=self._do_export).pack(anchor="w",
+                                                          pady=(10, 0))
 
         def _refresh_io(self):
             names = self._guard(self._deck_names) or []
@@ -846,7 +690,7 @@ def build_app():
         def _do_import(self):
             name = self.io_deck.get()
             if not name:
-                self._show_error("Pick a deck to import into.")
+                self.set_error("Pick a deck to import into.")
                 return
             path = filedialog.askopenfilename(
                 title="Import cards",
@@ -857,12 +701,12 @@ def build_app():
             n = self._guard(lambda: importer.import_file(
                 self.store, name, path, now=self._today()))
             if n is not None:
-                self._show_ok(f"Imported {n} card(s) into {name!r}.")
+                self.set_success(f"Imported {n} card(s) into {name!r}.")
 
         def _do_export(self):
             name = self.io_deck.get()
             if not name:
-                self._show_error("Pick a deck to export.")
+                self.set_error("Pick a deck to export.")
                 return
             path = filedialog.asksaveasfilename(
                 title="Export deck", defaultextension=".csv",
@@ -871,7 +715,8 @@ def build_app():
                 return
             n = self._guard(lambda: importer.export_file(self.store, name, path))
             if n is not None:
-                self._show_ok(f"Exported {n} card(s) to {os.path.basename(path)}.")
+                self.set_success(
+                    f"Exported {n} card(s) to {os.path.basename(path)}.")
 
         # ---- shutdown
         def _on_close(self):
@@ -888,8 +733,9 @@ def main():
     """Entry point: build the root window and run.  Degrades on headless hosts.
 
     Importing this module does nothing; only this function creates a Tk root.
-    With no display (e.g. a server) it prints a friendly note and returns 0
-    instead of raising, so callers can rely on a clean exit code.
+    With no display (e.g. a server) or without customtkinter installed, it
+    prints a friendly note and returns 0 instead of raising, so callers can
+    rely on a clean exit code.
     """
     try:
         import tkinter as tk
@@ -901,6 +747,10 @@ def main():
     try:
         App = build_app()
         app = App()
+    except ImportError as exc:
+        print(f"{APP_NAME}: the GUI needs the 'customtkinter' package "
+              f"({exc}). Install it with:  pip install customtkinter")
+        return 0
     except tk.TclError as exc:
         # Typically "no display name and no $DISPLAY environment variable".
         print(f"{APP_NAME}: no graphical display available — cannot start the "

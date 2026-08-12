@@ -12,7 +12,7 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install deps
-        run: python -m pip install --upgrade pip pyinstaller pytest
+        run: python -m pip install --upgrade pip -r requirements.txt pyinstaller pytest
       - name: Run tests
         run: python -m pytest -q
       - name: Build RecallDeck.exe
@@ -20,6 +20,8 @@ jobs:
           pyinstaller --onefile --windowed --name RecallDeck
           --icon recall-deck.ico
           --version-file packaging/version.txt
+          --hidden-import recalldeck.__main__
+          --collect-all customtkinter
           --add-data "recall-deck.ico;."
           recall_deck_app.py
       - name: Stage installer inputs
@@ -40,4 +42,10 @@ jobs:
           path: |
             dist/RecallDeck.exe
             packaging/dist/RecallDeck-Setup.exe
+          if-no-files-found: error
+      - name: Upload staging (for signed repack)
+        uses: actions/upload-artifact@v4
+        with:
+          name: recall-deck-staging
+          path: packaging/staging
           if-no-files-found: error

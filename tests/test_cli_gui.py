@@ -1,5 +1,7 @@
 """CLI end-to-end on a temp db, plus the headless GUI guarantees."""
 
+import pytest
+import sys
 import os
 
 from recalldeck import __main__ as cli
@@ -39,6 +41,8 @@ def test_cli_error_exits_cleanly(tmp_path, capsys):
     assert code == 1 and err.startswith("error:")
 
 
+@pytest.mark.skipif(sys.platform == "win32",
+                    reason="Windows CI has a real display; main() would open a window and block")
 def test_cli_import_export_round_trip(tmp_path, capsys):
     db = str(tmp_path / "cli.db")
     csvp = str(tmp_path / "d.csv")
@@ -52,6 +56,8 @@ def test_cli_import_export_round_trip(tmp_path, capsys):
     assert code == 0 and "Imported 1" in out
 
 
+@pytest.mark.skipif(sys.platform == "win32",
+                    reason="Windows CI has a real display; main() would open a window and block")
 def test_gui_imports_clean_and_headless_main_returns_zero(monkeypatch):
     # Importing the module must have no side effects and need no display.
     from recalldeck import gui
